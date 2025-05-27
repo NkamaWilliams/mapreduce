@@ -7,6 +7,7 @@ import (
 	"net/rpc"
 	"os"
 	"sync"
+	"time"
 )
 
 type Coordinator struct {
@@ -28,6 +29,7 @@ type Task struct {
 	TaskID  int
 	NReduce int
 	NMap    int
+	Start   time.Time
 }
 
 type TaskType int
@@ -56,9 +58,10 @@ func (c *Coordinator) RequestTask(args *RequestTaskArgs, reply *RequestTaskReply
 	defer c.mu.Unlock()
 
 	//Assign map tasks first
-	for _, task := range c.mapTasks {
+	for i, task := range c.mapTasks {
 		if !c.mapDone[task.TaskID] && !c.mapTaskAssigned[task.TaskID] {
-			reply.Task = task
+			c.mapTasks[i].Start = time.Now()
+			reply.Task = c.mapTasks[i]
 			c.mapTaskAssigned[task.TaskID] = true
 			return nil
 		}
@@ -69,9 +72,10 @@ func (c *Coordinator) RequestTask(args *RequestTaskArgs, reply *RequestTaskReply
 
 	//Assign reduce tasts
 	if allMapDone {
-		for _, task := range c.reduceTasks {
+		for i, task := range c.reduceTasks {
 			if !c.reduceDone[task.TaskID] && !c.reduceTaskAssigned[task.TaskID] {
-				reply.Task = task
+				c.reduceTasks[i].Start = time.Now()
+				reply.Task = c.reduceTasks[i]
 				c.reduceTaskAssigned[task.TaskID] = true
 				return nil
 			}
@@ -138,6 +142,39 @@ func (c *Coordinator) Done() bool {
 	return ret
 }
 
+// Reassign tasks if they take more than 5 seconds to complete
+func (c *Coordinator) CheckStatus() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if len(c.mapTasks) != len(c.mapDone) {
+		for val := range c.mapTaskAssigned {
+			if c.mapDone[val] {
+				continue
+			}
+			task := c.mapTasks[val]
+			if time.Since(task.Start) > 5*time.Second {
+				log.Printf("Reassigning map task %d due to worker timeout", val)
+				c.mapTaskAssigned[val] = false
+				task.Start = time.Now()
+			}
+		}
+	}
+
+	if len(c.reduceTasks) != len(c.reduceDone) {
+		for val := range c.reduceTaskAssigned {
+			if c.reduceDone[val] {
+				continue
+			}
+			task := c.reduceTasks[val]
+			if time.Since(task.Start) > 5*time.Second {
+				log.Printf("Reassigning reduce task %d due to worker timeout", val)
+				c.reduceTaskAssigned[val] = false
+				task.Start = time.Now()
+			}
+		}
+	}
+}
+
 // create a Coordinator.
 // main/mrcoordinator.go calls this function.
 // nReduce is the number of reduce tasks to use.
@@ -174,6 +211,16 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 			NMap:    len((files)),
 		})
 	}
+
+	go func() {
+		for {
+			if c.done {
+				break
+			}
+			c.CheckStatus()
+			time.Sleep(time.Second)
+		}
+	}()
 
 	c.server()
 	return &c
